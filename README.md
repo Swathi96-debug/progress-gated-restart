@@ -1,377 +1,310 @@
 # Progress-Gated Application-Server Restart Under Transient Load
-> Operating Systems case study comparing progress-gated and fixed-threshold application restart policies under transient load.
->
-> **Course:** Operating Systems Case Study (BTech 3rd Year)  
-> **Deployment Target:** AWS Elastic Beanstalk (Single-Instance Python Platform)  
-> **Architecture:** Flask Foundation & Experiment Framework
+
+> **Operating Systems Case Study (BTech 3rd Year - Computer Science & Engineering)**
+> **GitHub Repository:** [https://github.com/Swathi96-debug/progress-gated-restart](https://github.com/Swathi96-debug/progress-gated-restart)
+> **Deployment Target:** AWS Elastic Beanstalk (Single-Instance Python Platform on Amazon Linux 2023)
 
 ---
 
-## 1. Project Overview & Architectural Context
+## 1. What This Project Is About
 
-This case study investigates **progress-gated restart policies** for application servers subjected to transient overload or deadlock-like degradation. 
+When running web applications in cloud environments, services occasionally experience slow responses. This can happen because of a sudden spike in user requests, heavy background tasks, or database delays.
 
-In traditional cloud operations, health checks often rely on binary liveness endpoints (`/health`). However, under transient load spikes, resource exhaustion, or lock contention, an application server might still respond to lightweight health probes while its primary worker threads are stalled and making zero forward progress on real client work. Conversely, an aggressive timeout-based reboot policy risks restarting servers that are simply experiencing temporary delay, exacerbating queue backpressure and creating a cascading reboot storm.
+In real-world operations, systems often use automated health checks. A typical automated recovery rule looks like this: *if response latency exceeds a threshold (for example, 150 ms) or if a probe times out, restart the application server.*
 
-To study and evaluate restart policies under controlled conditions:
-- The application tracks a **monotonically increasing completion counter** reflecting actual completed units of work.
-- Worker threads record detailed latency and throughput metrics.
-- Controlled **fault injection** primitives simulate temporary overload, stalled progress, and hard failure without modifying OS kernels or running untrusted container runtimes.
-- An independent **experiment framework** evaluates three comparative policies sharing identical latency thresholds and cooldowns:
-  1. **No-Restart Control (`NoRestartPolicy`)**: Observes natural system recovery under transient load without intervention.
-  2. **Fixed-Threshold Policy (`FixedThresholdPolicy`)**: Requests a restart immediately when the common latency threshold is met, subject to shared cooldown and duplicate-restart protection.
-  3. **Progress-Gated Policy (`ProgressGatedPolicy`)**: When the common latency trigger is met, observes progress for a bounded interval; continues waiting while progress occurs (`counter_delta > 0`) and recovery remains possible, but restarts on confirmed stalled progress (`counter_delta == 0`) or when the hard deadline expires.
-- Restart operations are decoupled through a pluggable **adapter interface**:
-  - `SimulatedRestartAdapter`: For zero-cost local automated testing and development.
-  - `ElasticBeanstalkRestartAdapter`: For future AWS Elastic Beanstalk environments via `boto3`.
+The problem with this traditional **Fixed-Threshold** reboot policy is that restarting a server has a high cost. A restart drops in-flight connections, wipes out in-memory caches, and forces the runtime to re-initialize. If the server was simply working through a temporary traffic spike and would have caught up on its own a second later, restarting it actually makes the problem worse. In severe cases, rebooting under load triggers a reboot storm across multiple instances.
 
-> [!NOTE]
-> **Scientific Integrity & Scope Note:**  
-> We do not claim that the project or algorithm is novel based on implementation alone. It serves as an empirical BTech operating systems case study. Mocked restart events are strictly labeled as simulated and never combined with real AWS measurements.
+However, if worker threads are truly deadlocked or stuck in an unrecoverable state, the server will never fix itself. In that case, doing nothing is equally bad, and a reboot is necessary.
+
+In this case study, we implemented and evaluated an alternative policy called **Progress-Gated Restart**. Instead of checking only whether requests are taking longer than a threshold, the policy also monitors whether the application is still making forward progress by tracking an atomic completion counter ($\Delta C$).
+
+- If requests are slow but work is still getting finished ($\Delta C > 0$), restarts are held back to allow natural recovery.
+- If requests are slow and zero work is completing over an observation window ($\Delta C = 0$), or if a hard deadline expires, a restart is triggered.
 
 ---
 
-## 2. Project Directory Structure
+## 2. The Three Restart Policies
+
+All three policies share the same configuration parameters (defined in `PolicyConfig`) to ensure tests are strictly comparable:
+- **Latency Threshold ($T$):** $150\text{ ms}$ for local simulations (calibrated to $500\text{ ms}$ for live AWS trials to account for network transit).
+- **Observation Window:** $0.3\text{ s}$ (or $0.4\text{ s}$ in CLI single trials; $2.0\text{ s}$ on AWS).
+- **Hard Deadline:** $1.5\text{ s}$ locally (or $1.6\text{ s}$ in CLI; $60.0\text{ s}$ on AWS) as an upper bound on sustained degradation.
+- **Cooldown Window:** $1.2\text{ s}$ locally (or $1.8\text{ s}$ in CLI; $60.0\text{ s}$ on AWS) to prevent repeated immediate reboots.
+
+### Policy Details
+
+1. **Control Policy (`NoRestartPolicy`)**
+   Does not trigger any restarts. It acts as our baseline to observe how the application handles load naturally and to show what happens when a permanent deadlock occurs without any recovery mechanism.
+
+2. **Fixed-Threshold Policy (`FixedThresholdPolicy`)**
+   Reboots the application immediately as soon as observed request latency exceeds the threshold $T$ (or if a probe fails), subject to cooldown checks. It does not check whether work is still getting done.
+
+3. **Progress-Gated Policy (`ProgressGatedPolicy`)**
+   When observed latency crosses $T$, it enters an observation window ($0.3\text{ s}$ in the batch benchmark). During this window, it checks the change in completed requests:
+   $$\Delta C = C_t - C_{t-1}$$
+   - **If $\Delta C > 0$:** Work is still completing. The restart is withheld because the server is actively processing its queue and may recover on its own.
+   - **If $\Delta C == 0$:** Zero work completed during the observation window. The policy confirms a stall and triggers a restart.
+   - **Hard Deadline:** If latency stays degraded past the hard deadline ($1.5\text{ s}$ locally), it restarts anyway as a fail-safe, even if minor progress is occurring.
+
+### Edge Case Handling in Code
+- **Counter Resets & Reboots:** When a server restarts, `completion_counter` drops back to 0 and the process ID (`pid`) changes. `ProgressGatedPolicy` detects process changes and counter drops, immediately establishing a new baseline instead of misinterpreting the drop as negative progress or a stall.
+- **Probe Failures:** If a health or metrics probe fails due to a temporary network timeout, the policy does not treat missing data as confirmed zero progress ($\Delta C = 0$). It withholds a restart until it can confirm a true stall.
+- **Duplicate Restart Prevention:** `RestartController` uses a `threading.Lock` so concurrent worker threads cannot trigger overlapping restarts while one is already in progress.
+
+---
+
+## 3. Workload and Failure Scenarios
+
+We tested all three policies across four workload and failure scenarios (implemented in `experiment/workload.py`):
+
+1. **Transient Latency Spike (`transient_latency`)**
+   From offset $t = 1.0\text{ s}$ to $t = 2.5\text{ s}$ ($1.5\text{ s}$ duration), request delay temporarily jumps from baseline $20\text{ ms}$ to $250\text{ ms}$ (exceeding the $150\text{ ms}$ threshold). All requests continue to succeed with HTTP 200, and forward progress continues ($\Delta C > 0$).
+   - *Goal:* Verify whether a policy can distinguish a temporary slowdown from a real crash, avoiding false-positive reboots.
+
+2. **Stalled Progress (`stalled_progress`)**
+   At offset $t = 1.0\text{ s}$, a fault is injected that causes simulated worker threads to block on a synchronization event (`threading.Event`). Completed work stops completely ($\Delta C == 0$), while `/metrics` and `/health` endpoints remain responsive.
+   - *Goal:* Verify whether a policy correctly detects the lack of progress and initiates a recovery reboot.
+
+3. **Flapping Overload (`flapping_overload`)**
+   The application enters an intermittent load-shedding state where requests alternate between HTTP 503 rejections and successful HTTP 200 responses.
+   - *Goal:* Observe how policies handle bursty, intermittent load-shedding where partial progress is made.
+
+4. **Transient Overload (`transient_overload`)**
+   At offset $t = 1.0\text{ s}$, the server enters a temporary overload state for $1.5\text{ s}$, returning HTTP 503 (`Retry-After`) to shed load before automatically recovering back to normal.
+   - *Goal:* Evaluate behavior when requests fail due to deliberate queue rejection rather than thread deadlocks.
+
+---
+
+## 4. How the System is Built
+
+The project has three main components:
 
 ```
 progress-gated-restart/
-├── application.py          # Flask WSGI application, endpoints, thread-safe state & logging
-├── requirements.txt        # Pinned production, testing, and AWS SDK dependencies
-├── simulate_local.py       # Self-contained CLI runner for local benchmark simulations
-├── .env.example            # Sample development environment configuration
-├── .gitignore              # Ignores virtual environments, caches, secrets, and test logs
-├── README.md               # Architecture documentation, runbooks, and endpoint reference
-├── results/                # Output directory for immutable JSONL and CSV event logs
-├── experiment/             # Modular experiment and control framework
-│   ├── __init__.py         # Package exports
-│   ├── models.py           # Dataclasses (PolicyConfig, ProgressObservation, PolicyDecision, etc.)
-│   ├── adapters.py         # RestartAdapter base, SimulatedRestartAdapter, ElasticBeanstalkRestartAdapter
-│   ├── policies.py         # NoRestartPolicy, FixedThresholdPolicy, ProgressGatedPolicy
-│   ├── controller.py       # RestartController, guarded restarts, progress polling loops
-│   ├── workload.py         # WorkloadGenerator (normal, transient overload, stalled progress)
-│   ├── runner.py           # ExperimentRunner orchestrator with bounded run times
-│   └── analysis.py         # Immutable log analyzer, recovery time, downtime, and reporting
-└── tests/
-    ├── __init__.py         # Test package marker
-    ├── test_application.py # Application and endpoint tests (20 tests)
-    ├── test_policies.py    # Policy evaluation, counter resets, cooldowns, adapter tests (13 tests)
-    └── test_workload_and_analysis.py # Logger, trial IDs, analyzer accuracy, and scenario tests (4 tests)
+├── application.py          # Flask backend, in-memory state, and telemetry endpoints
+├── requirements.txt        # Python dependencies (Flask, Gunicorn, Boto3, Pytest)
+├── Procfile                # Elastic Beanstalk entry point (single-worker Gunicorn)
+├── simulate_local.py       # CLI tool for local simulation runs and batch benchmarks
+├── run_live_aws.py         # CLI tool for running tests against an AWS deployment
+├── .ebignore               # AWS deployment bundle ignore rules
+├── .gitignore              # Git ignore rules for virtual environments, caches, and logs
+│
+├── experiment/             # Experiment framework and policy logic
+│   ├── models.py           # Dataclasses (PolicyConfig, PolicyDecision, etc.)
+│   ├── policies.py         # Implementations of the three restart policies
+│   ├── controller.py       # RestartController, guarded locks, and polling loops
+│   ├── adapters.py         # SimulatedRestartAdapter and ElasticBeanstalkRestartAdapter
+│   ├── workload.py         # Workload generator and fault injection schedules
+│   ├── runner.py           # ExperimentRunner orchestrator
+│   ├── analysis.py         # Log parser and summary metrics calculator
+│   ├── batch.py            # Batch execution orchestrator for multi-trial experiments
+│   └── data/               # Canonical bundled benchmark CSV datasets
+│       ├── batch_aggregated_20261027_215526.csv
+│       └── batch_summary_20261027_215526.csv
+│
+├── templates/
+│   └── dashboard.html      # Interactive web dashboard
+├── static/
+│   ├── css/dashboard.css   # Dashboard styles
+│   ├── js/dashboard.js     # Live telemetry charting and client logic
+│   ├── favicon.svg         # Vector favicon matching cyan brand palette
+│   └── favicon.ico         # Standard 32x32 browser favicon
+│
+└── tests/                  # 92 automated regression and unit tests
+    ├── test_application.py
+    ├── test_dashboard_ui.py
+    ├── test_policies.py
+    ├── test_workload_and_analysis.py
+    └── test_live_aws_runner.py
 ```
+
+### Key Technical Details
+
+- **Atomic Completion Counter:** In `application.py`, the `ApplicationState` class maintains `completion_counter` using Python's `threading.Lock`. Every successful request through `GET /work` atomically increments this integer.
+- **Restart Mechanics & Adapter Segregation:** Restart operations are decoupled using an adapter interface so we never accidentally invoke cloud APIs during development:
+  - `SimulatedRestartAdapter`: Used for local test suites, dashboard simulations, and the 30-trial benchmark batch. It simulates reboot delay (~50–80 ms) and executes an in-memory state reset callback. Real AWS restarts are strictly **0**.
+  - `ElasticBeanstalkRestartAdapter`: Used only when explicitly testing against live AWS infrastructure via `run_live_aws.py`. It invokes `boto3.client('elasticbeanstalk').restart_app_server()`.
+- **Vanilla Web Dashboard:** Accessible at `GET /dashboard`. It uses plain HTML5, vanilla CSS, and the native HTML5 Canvas API for live telemetry streaming (zero external charting libraries or heavy CDN dependencies). It also provides an interactive work probe tester (`GET /work?delay_ms=N`) and CSV export buttons.
 
 ---
 
-## 3. Setup & Execution (Windows PowerShell)
+## 5. Local Setup and Usage
 
-Follow these exact commands in Windows PowerShell:
+### Prerequisites
+- Python 3.10, 3.11, or 3.12
+- Windows PowerShell, macOS terminal, or Linux bash
 
-### 3.1. Clone / Navigate to Project Directory
+### 1. Clone the Repository and Set Up Virtual Environment
+
 ```powershell
-Set-Location -Path "C:\Users\Swathi\.gemini\antigravity-ide\scratch\progress-gated-restart"
-```
+# Navigate into the project folder (or your cloned path)
+cd progress-gated-restart
 
-### 3.2. Create and Activate Virtual Environment
-```powershell
+# Create a virtual environment
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-*(If PowerShell script execution is restricted, run `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process` prior to activating).*
 
-### 3.3. Install Dependencies
-```powershell
-python -m pip install --upgrade pip
+# Activate it (Windows PowerShell)
+.\.venv\Scripts\Activate.ps1
+
+# (On Linux / macOS, use: source .venv/bin/activate)
+
+# Install dependencies
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3.4. Configure Environment Variables for Development
-```powershell
-Copy-Item .env.example .env
-```
-For local testing with fault injection enabled:
-```powershell
-$env:EXPERIMENT_MODE="true"
-$env:FAULT_INJECTION_TOKEN="my-local-secret-token"
-```
+### 2. Run the Test Suite
 
-### 3.5. Run Automated Tests
+We have 92 automated unit and integration tests covering the Flask routes, policy logic, cooldown timing, counter reset handling, and dashboard client behavior:
+
 ```powershell
 pytest -v
 ```
-*(Runs 41 automated regression tests covering endpoints, thread safety, policies, cooldowns, adapter mutations, analyzer deduplication, and batch summary aggregation).*
 
-### 3.6. Run Matched Simulation Benchmarks (Single Trials)
-Execute matched trials across policies with identical workload and fault schedules:
-```powershell
-# Scenario A: Transient Latency Degradation (work succeeds with elevated latency, then recovers naturally)
-python simulate_local.py --policy control --scenario transient_latency --duration 5.0
-python simulate_local.py --policy progress_gated --scenario transient_latency --duration 5.0
-python simulate_local.py --policy fixed_threshold --scenario transient_latency --duration 5.0
+All 92 tests should pass in under 10 seconds.
 
-# Scenario B: Stalled Progress Fault (work deadlocks until restart intervention clears fault)
-python simulate_local.py --policy control --scenario stalled_progress --duration 5.0
-python simulate_local.py --policy progress_gated --scenario stalled_progress --duration 5.0
-python simulate_local.py --policy fixed_threshold --scenario stalled_progress --duration 5.0
-```
+### 3. Start the Local Server and Dashboard
 
-### 3.7. Run Reproducible Batch Experiment (30 Matched Trials)
-Execute all three policies against both scenarios with 5 trials per combination (30 trials total):
-```powershell
-# Run the complete 30-trial batch
-python simulate_local.py --batch --trials 5 --duration 3.5
-
-# Inspect the generated per-trial and aggregate summary CSV in PowerShell:
-Get-ChildItem results/batch_summary_*.csv | Select-Object -Last 1 | Import-Csv | Format-Table -AutoSize
-
-# Inspect only the aggregate statistical means and standard deviations:
-Get-ChildItem results/batch_aggregated_*.csv | Select-Object -Last 1 | Import-Csv | Format-Table -AutoSize
-```
-
-### 3.8. Launch Development Server (Standalone)
 ```powershell
 python application.py
 ```
-The server starts on `http://127.0.0.1:5000` with multi-threading enabled (`threaded=True`).
 
----
+Open your browser and navigate to:
+**`http://127.0.0.1:5000/dashboard`**
 
-## 4. Policy Architectures & Correctness Guarantees
+From the dashboard you can:
+- Watch live node telemetry and latency metrics.
+- Send test work requests using the probe tool (`GET /work?delay_ms=40`).
+- Run interactive simulated benchmark trials across policies and scenarios.
+- View and download historical benchmark CSV files.
 
-Both comparative policies (`FixedThresholdPolicy` and `ProgressGatedPolicy`) and the control policy (`NoRestartPolicy`) share identical parameters via `PolicyConfig`:
-- **`latency_threshold_ms`**: Common latency threshold T beyond which a probe/request is flagged as degraded.
-- **`observation_interval_seconds`**: Bounded interval between consecutive progress observations.
-- **`hard_deadline_seconds`**: Maximum allowed continuous degradation/stall before restart.
-- **`cooldown_seconds`**: Minimum quiet period enforced after a restart before another can be initiated.
-- **`recovery_consecutive_successes`**: Number of consecutive healthy probes required to certify recovery.
+### 4. Running CLI Simulations
 
-### Policy Trigger Differences:
-1. **`FixedThresholdPolicy`**:
-   - Triggers a restart **immediately** upon meeting the latency threshold T (`probe_latency_ms > latency_threshold_ms` or health failure), subject to shared cooldown and duplicate-restart protection.
-   - It does **not** wait for `hard_deadline_seconds` or evaluate progress counter deltas.
-2. **`ProgressGatedPolicy`**:
-   - When the same latency threshold T is crossed, it enters an observation phase for a bounded interval (`observation_interval_seconds`).
-   - If work is progressing (`counter_delta > 0`), it continues waiting while recovery remains possible.
-   - If progress is confirmed stalled (`counter_delta == 0` over the observation interval), it initiates a restart.
-   - If degradation persists past `hard_deadline_seconds`, it initiates a restart as a safety upper bound.
-3. **`NoRestartPolicy`**:
-   - Observes and records natural recovery behavior without ever initiating a restart.
+You can also run benchmarks directly from the command line using `simulate_local.py`:
 
-### Anomaly Handling:
-1. **Counter Resets**: When `completion_counter < last_counter` (e.g. after a process restart or container reload), the baseline is re-established immediately. The drop is never mistaken for new completed work nor interpreted as a stall.
-2. **Process Identifier Changes**: When `pid != last_pid`, the baseline is updated and the delta reset to 0 without misinterpreting as a stall.
-3. **Probe Failures / Missing Metrics**: If an HTTP health or metrics probe fails due to network timeout or connection reset, the policy withholds stall conclusions. Missing telemetry is never treated as proof of stalled progress (`delta == 0`).
-4. **Duplicate / Overlapping Restarts**: `RestartController` uses a strict `threading.Lock` and status flag. If a restart is already executing, all concurrent trigger attempts are rejected.
-5. **Bounded Polling & Execution**: All loops in `RestartController` and `WorkloadGenerator` enforce explicit timeouts (`duration_seconds`) to guarantee that no test or run can hang indefinitely.
-
----
-
-## 5. Restart Adapters & AWS Elastic Beanstalk Scope
-
-### 5.1. `SimulatedRestartAdapter`
-- Strictly designated with `is_simulated = True` and `adapter_type = "simulated"`.
-- **State Mutation Semantics**:
-  - If `on_restart_callback` is provided (e.g. in test suites or `simulate_local.py`), this adapter executes the callback to reset local server fault state or counters.
-  - If `on_restart_callback` is `None`, this adapter ONLY records the restart event and simulates execution latency without altering the running server process state.
-  - Every restart record includes `details["state_mutated"]` for auditing.
-
-### 5.2. `ElasticBeanstalkRestartAdapter`
-- Designated with `is_simulated = False` and `adapter_type = "aws_elastic_beanstalk"`.
-- Uses `boto3.client('elasticbeanstalk').restart_app_server(EnvironmentName=...)`.
-
-> [!WARNING]
-> **Important Elastic Beanstalk Operational Scope:**
-> - `RestartAppServer` restarts the **application container server** (Gunicorn, Nginx, Apache) across **every EC2 instance** in the target environment.
-> - It does **not** reboot the underlying EC2 instance or OS kernel.
-> - We do **not** claim that it necessarily restarts a particular Python process until that behavior has been empirically verified and benchmarked on the specific AWS platform.
-> - Actual AWS restart invocations are never executed during local testing.
-
----
-
-## 6. Telemetry & Log Analysis Definitions
-
-Every benchmark run produces immutable event logs in `results/`:
-- `<run_id>.jsonl`: Complete, atomic JSONL stream of requests, progress observations, policy decisions, restart events, and recoveries. Every entry contains a timestamp, ISO timestamp, and `trial_id`.
-- `<run_id>_requests.csv`: High-throughput tabular log of every individual request with `trial_id`, timestamps, latency, and status.
-
-### Metric Definitions:
-1. **Recovery Time**: The elapsed duration (in seconds) from the initial scheduled fault injection timestamp until the first subsequent validated recovery event (requiring N consecutive healthy, low-latency probes). If no valid recovery event occurred before trial termination, recovery time is reported as `None` / `N/A`.
-2. **Estimated Downtime (Request-Inferred)**: The empirical duration (in seconds) between the first failed work request and the first subsequent successful work request. Because client request arrival is discrete rather than continuous, this metric is strictly labeled as an estimated request-inferred downtime, not a continuous kernel-measured outage.
-3. **Restart Deduplication**: Restarts are tracked by unique UUIDs (`restart_id`). Duplicate log entries are never counted twice. Simulated restarts are strictly segregated from real AWS Elastic Beanstalk API requests.
-
-### Analyzing Log Files Directly:
 ```powershell
-python -m experiment.analysis results/local_sim_fixed_threshold_transient_overload.jsonl
+# Run a single trial comparing policies under transient latency
+python simulate_local.py --policy control --scenario transient_latency --duration 3.5
+python simulate_local.py --policy fixed_threshold --scenario transient_latency --duration 3.5
+python simulate_local.py --policy progress_gated --scenario transient_latency --duration 3.5
+
+# Run a single trial under a stalled progress deadlock
+python simulate_local.py --policy progress_gated --scenario stalled_progress --duration 3.5
+
+# Run a full 30-trial benchmark batch (5 trials x 3 policies x 2 scenarios)
+python simulate_local.py --batch --trials 5 --duration 3.5
 ```
 
 ---
 
-## 7. Application Endpoints & Verification
+## 6. Experimental Results & Analysis
 
-### 7.1. `GET /` — Project Metadata
-```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:5000/" | ConvertTo-Json -Depth 4
-```
+We ran a controlled 30-trial benchmark batch using `SimulatedRestartAdapter` (Batch ID: `20261027_215526`). Each configuration was repeated 5 times with matched request schedules to ensure fair comparison.
 
-### 7.2. `GET /health` — Liveness & Crash State Probe
-Returns HTTP 200 during normal operation, temporary overload, or stalled progress. Returns HTTP 500 when simulated hard failure is active.
-```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:5000/health"
-```
+The canonical raw data is stored in [`experiment/data/batch_aggregated_20261027_215526.csv`](experiment/data/batch_aggregated_20261027_215526.csv) and [`experiment/data/batch_summary_20261027_215526.csv`](experiment/data/batch_summary_20261027_215526.csv).
 
-### 7.3. `GET /metrics` — Telemetry Snapshot
-Returns non-blocking JSON containing PID, uptime, completion counter, completed/failed requests, and fault state.
-```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:5000/metrics" | ConvertTo-Json -Depth 4
-```
+### Summary Table
 
-### 7.4. `GET /work?delay_ms=N` — Simulated Work Execution
-Simulates CPU/IO work with duration specified in milliseconds (allowed bounds: `0` to `30000`). Increments `completion_counter` only on successful completion.
-```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:5000/work?delay_ms=25"
-```
+| Scenario | Policy | Trials | Recovery Rate | Success Rate (Mean) | Restarts (Mean ± Std) | Recovery Time (Mean ± Std) | Estimated Downtime |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Transient Latency** | Control | 5 | 5 / 5 (100%) | 100.0% | 0.0 ± 0.0 | 1.58s ± 0.16s | 0.0s |
+| | **Fixed-Threshold** | 5 | 5 / 5 (100%) | 100.0% | **1.0 ± 0.0** | 1.70s ± 0.00s | 0.0s |
+| | **Progress-Gated** | 5 | 5 / 5 (100%) | 100.0% | **0.0 ± 0.0** | 1.70s ± 0.00s | 0.0s |
+| **Stalled Progress** | Control | 5 | 0 / 5 (0%) | 28.6% | 0.0 ± 0.0 | *Unrecovered* | 2.39s ± 0.01s |
+| | **Fixed-Threshold** | 5 | 5 / 5 (100%) | 100.0% | 1.0 ± 0.0 | **0.79s ± 0.01s** | 0.0s |
+| | **Progress-Gated** | 5 | 5 / 5 (100%) | 100.0% | 1.0 ± 0.0 | **1.10s ± 0.00s** | 0.0s |
 
-### 7.5. `POST /experiment/fault` — Controlled Fault Injection
-Requires `EXPERIMENT_MODE=true` and `X-Fault-Token` header.
-- **`normal`**: Clears active faults.
-- **`temporary_overload`**: Rejects work requests with HTTP 503 for `duration_seconds`, then automatically recovers to `normal`.
-- **`simulated_stalled_progress`**: Causes worker threads to wait on a synchronization event without blocking `/metrics` or `/health`.
-- **`hard_failure`**: Causes `/health` and `/work` to return HTTP 500.
+### Metric Definitions & Measurement Methodology
 
----
+- **Recovery Time:** Measured from the initial fault onset ($t = 1.0\text{ s}$) until the application server responds to 2 consecutive healthy, low-latency probes ($< 80\text{ ms}$). If a trial never recovered before the $3.5\text{ s}$ limit, it is recorded as *Unrecovered* (`N/A`).
+- **Estimated Downtime (Request-Inferred):** Elapsed duration between the first failed client request and the first subsequent successful request. For transient latency, downtime was $0.0\text{ s}$ because work continued completing with HTTP 200. For stalled progress under Control, downtime was $2.39\text{ s}$ because threads stayed blocked until trial cutoff.
+- **Restarts Count:** Monitored via `SimulatedRestartAdapter`. Every trial in this benchmark was run in simulated mode, so real AWS Elastic Beanstalk restarts were strictly **0**.
 
-## 8. Cautious AWS Elastic Beanstalk Deployment Checklist (NOT YET EXECUTED)
+### What the Numbers Show
 
-> [!IMPORTANT]
-> **Safety & Scope Boundary:**  
-> The project is currently configured and benchmarked for local execution only. **No AWS resources have been provisioned and no AWS APIs have been invoked.** The following checklist outlines the necessary pre-flight steps and architecture safeguards required prior to any future AWS deployment.
+1. **Under Transient Latency (Temporary Slowdown):**
+   - The **Control** policy shows that the system naturally recovers in about $1.58\text{ s}$ without any restarts.
+   - The **Fixed-Threshold** policy triggers an unnecessary restart in 100% of the trials ($1.0 \pm 0.0$). This is a false-positive restart: the server was healthy and would have caught up, but was rebooted anyway simply because latency went above $150\text{ ms}$.
+   - The **Progress-Gated** policy observes that work is still getting finished ($\Delta C > 0$) and holds back the restart ($0.0 \pm 0.0$ restarts), letting the server recover naturally.
 
-### 8.1. WSGI Concurrency & Procfile
-- [x] **Procfile Configured:** [Procfile](file:///C:/Users/Swathi/.gemini/antigravity-ide/scratch/progress-gated-restart/Procfile) is created with single-worker multi-threaded Gunicorn:
-  ```
-  web: gunicorn --workers=1 --threads=8 application:application
-  ```
-- [x] **In-Memory Counter Integrity:** Because `completion_counter`, `stall_event`, and telemetry reside in Python memory, Gunicorn must NEVER be run with `--workers > 1` on AWS unless state is migrated to Redis, Memcached, or an OS-level shared memory segment (`mmap` / POSIX IPC). Multi-worker Gunicorn would fragment the completion counter across worker PIDs.
-- [x] **Dependencies:** `gunicorn>=21.2.0,<23.0.0` is pinned in `requirements.txt`.
-
-### 8.2. Secrets Management & Environment Configuration
-- [x] **Zero Hardcoded Secrets:** No tokens, API keys, or AWS credentials are committed. `.env` is ignored by `.gitignore`.
-- [ ] **Provision Environment Properties:** Prior to running live experiments, inject configuration via AWS Elastic Beanstalk Environment Properties or AWS Systems Manager (SSM) Parameter Store:
-  ```powershell
-  # Configure via AWS CLI (execute only when provisioning environment)
-  aws elasticbeanstalk update-environment `
-      --environment-name "progress-gated-env" `
-      --option-settings `
-          Namespace=aws:elasticbeanstalk:application:environment,OptionName=EXPERIMENT_MODE,Value="true" `
-          Namespace=aws:elasticbeanstalk:application:environment,OptionName=FAULT_INJECTION_TOKEN,Value="<cryptographic-secret-token>"
-  ```
-- [ ] **SSM Parameter Store Alternative (Recommended for Production):** Store encrypted token in `/progress-gated/fault-token` with `SecureString` KMS encryption.
-
-### 8.3. IAM Role & Controller Permissions
-- [ ] **Controller IAM Policy:** When running `ElasticBeanstalkRestartAdapter` against live AWS infrastructure, the executing IAM identity requires the following least-privilege permission policy:
-  ```json
-  {
-      "Version": "2012-10-17",
-      "Statement": [
-          {
-              "Effect": "Allow",
-              "Action": "elasticbeanstalk:RestartAppServer",
-              "Resource": "arn:aws:elasticbeanstalk:<region>:<account-id>:environment/<app-name>/<environment-name>"
-          }
-      ]
-  }
-  ```
-- [ ] **Instance Profile:** EC2 instances in the single-instance Elastic Beanstalk environment require standard `AWSElasticBeanstalkWebTier` permissions.
-
-### 8.4. Asynchronous Cloud Restart Semantics & Timeout Handling
-- [ ] **Asynchronous API Behavior:** `client.restart_app_server()` is an asynchronous API call. It returns HTTP 200 once the restart command is queued; it does NOT wait for container processes to reload.
-- [ ] **Restart Latency Window:** While `SimulatedRestartAdapter` completes state mutation in ~50ms, AWS Elastic Beanstalk container restarts take between 15 and 45 seconds.
-- [ ] **Controller Cooldown Calibration:** `PolicyConfig.cooldown_seconds` must be increased from 1.5s to at least 45.0s on AWS to prevent triggering cascading restarts while Gunicorn / Nginx are mid-reload.
-- [ ] **Audit Trail Segregation:** All restart events emitted by `ElasticBeanstalkRestartAdapter` carry `is_simulated = False` and `adapter_type = "aws_elastic_beanstalk"` to ensure cloud actions are never conflated with simulated local trials.
-
-### 8.5. Pre-Flight Staging Smoke Test Checklist
-Before launching autonomous experiment workloads against AWS:
-1. `GET /health` returns HTTP 200 and `"status": "healthy"`.
-2. `GET /metrics` returns valid monotonic counter, PID, and uptime.
-3. `GET /work?delay_ms=25` returns HTTP 200 and increments `completion_counter` by exactly 1.
-4. `POST /experiment/fault` with invalid token returns HTTP 401 Unauthorized.
-5. Verify that single-worker multi-threaded Gunicorn is actively serving requests without worker churn.
+2. **Under Stalled Progress (Deadlock):**
+   - The **Control** policy completely fails to recover ($0\%$ recovery rate, only $28.6\%$ of requests completed before the hang), proving that automated intervention is required.
+   - Both **Fixed-Threshold** and **Progress-Gated** policies successfully detect the problem, trigger a restart, and achieve a $100\%$ success rate.
+   - **Trade-off:** Fixed-Threshold recovers faster ($0.79\text{ s}$ vs. $1.10\text{ s}$) because it triggers immediately. Progress-Gated takes slightly longer ($+0.31\text{ s}$) because it deliberately spends an observation window checking if the completion counter is incrementing before confirming that the worker is truly stuck.
 
 ---
 
-## 9. Live AWS Experiment Runner (`run_live_aws.py`)
+## 7. HTTP API Reference
 
-A dedicated entry point, [run_live_aws.py](file:///C:/Users/Swathi/.gemini/antigravity-ide/scratch/progress-gated-restart/run_live_aws.py), orchestrates live cloud benchmark trials against deployed Elastic Beanstalk environments with strict safety gates.
+The Flask application exposes the following endpoints:
 
-### 9.1. Safety Features & Architectural Guarantees
-1. **Explicit Restarts Authorization:** The `--allow-restarts` flag is mandatory for `fixed_threshold` and `progress_gated`. Without this flag or `--prohibit-restarts`, the runner aborts with a safety exception before initiating any action.
-2. **Mechanically Enforced No-Restart Mode:** For transient-latency validation, the `--prohibit-restarts` flag mechanically blocks and intercepts any restart attempt without calling AWS APIs. If any policy requests a restart, the trial fails safely.
-3. **Explicit Fault Authorization & Mandatory Token:** The `--allow-fault-injection` flag AND a configured, non-empty secret token (`--fault-token` or `FAULT_INJECTION_TOKEN` env var) are mandatory for `stalled_progress`.
-4. **No Silent Fallback:** The live runner uses `ElasticBeanstalkRestartAdapter` and never silently falls back to local simulated restarts.
-5. **Isolated Control Permissions:** The `control` policy never invokes AWS restart APIs and can run without AWS credentials or environment permissions.
-6. **Honest Recovery Lifecycle:** An HTTP 200 from AWS API only marks API acceptance. Application recovery requires $N=3$ consecutive healthy probes post-restart. Interrupted or timed-out trials are reported as UNRECOVERED.
-7. **Calibrated Cloud Defaults:** Defaults to 120s duration, 2.0s observation interval, 500ms latency trigger, 60s restart cooldown, and 5.0s probe timeouts to accommodate internet RTT and container reload cycles.
+| Method & Route | Purpose | Description |
+| :--- | :--- | :--- |
+| `GET /` | Root Directory | Returns JSON metadata with project description, endpoints, and links. Redirects browser requests to `/dashboard`. |
+| `GET /dashboard` | Web Dashboard | Returns the HTML5 research dashboard with live metrics, charts, and trial controls. |
+| `GET /favicon.ico` | Favicon | Serves the standard 32x32 browser favicon from `static/favicon.ico`. |
+| `GET /health` | Health Check | Returns HTTP 200 `{"status": "healthy"}` during normal operation, overload, and stalls. Returns HTTP 500 during simulated hard crashes. |
+| `GET /metrics` | Telemetry Snapshot | Returns JSON containing current PID, uptime, `completion_counter`, completed/failed request totals, and current fault state. Non-blocking. |
+| `GET /work?delay_ms=N` | Simulated Work | Simulates computational work with a configurable delay ($0$ to $30000\text{ ms}$). Increments `completion_counter` only on success. |
+| `POST /experiment/fault` | Fault Injection | Sets the server fault state (`normal`, `temporary_overload`, `simulated_stalled_progress`, `hard_failure`). Requires `EXPERIMENT_MODE=true` and `X-Fault-Token` header. |
+| `GET /api/results/aggregated` | Benchmark Stats | Returns aggregated statistics across policies and scenarios from the canonical benchmark dataset. |
+| `GET /api/results/summary` | Benchmark Trials | Returns detailed per-trial records from the canonical benchmark dataset. |
+| `GET /api/results/export?type=X` | CSV Download | Serves raw downloadable CSV files (`type=aggregated` or `type=summary`). |
+| `POST /api/experiment/run_trial` | Run Local Trial | Executes a safe local simulated experiment trial through the dashboard or API. |
 
-### 9.2. Pre-Flight Dry-Run Execution (Non-Mutating)
-The `--dry-run` flag performs non-destructive health and metrics checks against the live environment, queries environment status via read-only AWS APIs, and prints the planned configuration without calling restart APIs or injecting faults:
-```powershell
-python run_live_aws.py `
-    --base-url "http://progress-gated-env.eba-xyz.us-east-1.elasticbeanstalk.com" `
-    --environment-name "progress-gated-env" `
-    --policy progress_gated `
-    --scenario transient_latency `
-    --dry-run
+---
+
+## 8. AWS Elastic Beanstalk Deployment Notes
+
+The project was designed to be compatible with AWS Elastic Beanstalk (Python 3.11 / 3.12 on Amazon Linux 2023).
+
+### WSGI Concurrency Model
+
+Our [`Procfile`](Procfile) specifies:
+```text
+web: gunicorn --workers=1 --threads=8 application:application
 ```
+We intentionally use **1 worker process with 8 threads**. Because `completion_counter` and thread synchronization events reside in Python's in-memory state, running multiple Gunicorn worker processes would fragment the counter across different PIDs. In a future production multi-worker deployment, this counter would be moved to shared memory or an external store like Redis.
 
-### 9.3. Authorizing and Running Live Experiments
-Once dry-run passes, execute live trials following the staged validation protocol:
+### Mechanical Safety Gates in `run_live_aws.py`
 
-```powershell
-# 1. Phase 2: Transient Latency Validation (Mechanically Enforced No-Restart Mode)
-# Ensures zero AWS restart API calls can be made, even if a policy requests restart
-python run_live_aws.py `
-    --base-url "http://progress-gated-env.eba-xyz.us-east-1.elasticbeanstalk.com" `
-    --environment-name "progress-gated-env" `
-    --policy progress_gated `
-    --scenario transient_latency `
-    --duration 60.0 `
-    --prohibit-restarts
+When testing against live AWS environments, we added strict safety checks to prevent accidental cloud reboots:
+- **`--allow-restarts`**: Must be explicitly supplied on the command line; otherwise, the runner aborts before calling any AWS API.
+- **`--prohibit-restarts`**: Intercepts restart requests during validation trials and fails the trial safely if a restart is attempted.
+- **`--dry-run`**: Verifies connectivity, queries health, and inspects parameters without mutating AWS infrastructure.
+- **Confirmed Recovery Criteria:** An AWS API response of HTTP 200 merely means the restart request was accepted. We only consider the application recovered after $N = 3$ consecutive healthy, low-latency probes post-restart.
 
-# 2. Phase 3: Stalled Progress Restart Test (Explicit opt-in and authenticated token required)
-$env:FAULT_INJECTION_TOKEN = "your-live-cryptographic-token"
-python run_live_aws.py `
-    --base-url "http://progress-gated-env.eba-xyz.us-east-1.elasticbeanstalk.com" `
-    --environment-name "progress-gated-env" `
-    --policy progress_gated `
-    --scenario stalled_progress `
-    --duration 120.0 `
-    --cooldown 60.0 `
-    --allow-restarts `
-    --allow-fault-injection
+### Calibrating Cloud vs. Local Timing Parameters
 
-# 3. Emergency Fault Remediation (If an experiment is interrupted or aborted before recovery):
-# To immediately clear stalled progress without claiming experiment recovery:
-Invoke-RestMethod -Method POST -Uri "http://<ENV_URL>/experiment/fault" `
-    -Headers @{"X-Fault-Token"="$env:FAULT_INJECTION_TOKEN"} `
-    -ContentType "application/json" `
-    -Body '{"fault_state": "normal"}'
-```
+Timing parameters in `run_live_aws.py` differ from local simulation because operating conditions in the cloud are fundamentally different:
+- **Network Latency:** Over `localhost`, network transit takes $< 1\text{ ms}$, so any request taking $> 150\text{ ms}$ indicates server delay. Over the public internet with TLS termination and Nginx, baseline latency can be $50\text{ ms}$ to $100\text{ ms}$. Hence, `--latency-threshold` is set to $500\text{ ms}$ on AWS.
+- **Container Reload Time:** Local simulated restarts finish in $\sim 50\text{ ms}$, but AWS Elastic Beanstalk container restarts take between $15\text{ s}$ and $45\text{ s}$. To prevent reboot loops while Gunicorn is already reloading, `--cooldown` is increased from $1.2\text{ s}$ to $60.0\text{ s}$, and the observation window is set to $2.0\text{ s}$.
 
-### 9.4. Spending Limits & Manual Cost Checks
-To protect against runaway costs during live testing:
-1. **SingleInstance Environment:** Use single-instance environments (`eb create --single`) to eliminate the Application Load Balancer base charge ($16.20/month).
-2. **AWS Free Tier / Micro Instances:** Use `t4g.micro` or `t3.micro` instances (~$0.0104/hour on-demand).
-3. **AWS Budgets Alert:** Set a hard budget alert at **$5.00 USD** in the AWS Billing Console.
-4. **Execution Time Limit:** Restrict total live testing to a 30-minute window (cost: <$0.02 USD).
+---
 
-### 9.5. Complete Resource Teardown & Cleanup
-Immediately after testing, terminate all cloud resources to ensure zero ongoing charges:
-```powershell
-# 1. Terminate the Elastic Beanstalk environment and release EC2 instance and Elastic IP:
-aws elasticbeanstalk terminate-environment --environment-name "progress-gated-env" --terminate-resources
+## 9. Honest Limitations & What We Learned
 
-# 2. Delete the application definition:
-aws elasticbeanstalk delete-application --application-name "progress-gated-app"
+1. **Single-Worker In-Memory State**
+   Keeping the completion counter in-process memory is simple, fast, and thread-safe for a single worker. However, it does not scale across multiple Gunicorn workers or multiple EC2 instances behind a load balancer without an external atomic store (such as Redis or POSIX shared memory).
 
-# 3. Verify zero EC2 instances remain running:
-aws ec2 describe-instances `
-    --filters "Name=tag:elasticbeanstalk:environment-name,Values=progress-gated-env" "Name=instance-state-name,Values=running" `
-    --query "Reservations[*].Instances[*].InstanceId"
-```
+2. **The Observation Delay Trade-off**
+   Progress-Gated restart is not strictly "better" in every metric. When a server is genuinely deadlocked, waiting for an observation window ($0.3\text{ s}$ locally, $2.0\text{ s}$ to $5.0\text{ s}$ over the internet) means the reboot happens slightly later than a fixed-threshold policy. The benefit is preventing reboot storms during transient spikes, but the price is a slight delay in detecting true stalls.
+
+3. **Tuning the Observation Window**
+   If the observation interval is set too short, it behaves almost identically to a fixed-threshold policy. If set too long, users experience longer wait times during real outages. Choosing this value depends on typical request durations and service SLA requirements.
+
+4. **Simulated vs. Real Restarts**
+   Our 30-trial benchmark figures come from `SimulatedRestartAdapter`. While the request latency and workload dispatching are authentic, the actual operating system reboot was simulated in software to allow fast, reproducible batch runs without generating AWS bills.
+
+---
+
+## 10. References & Background Reading
+
+- Candea, G., & Fox, A. (2001). *Crash-Only Software.* Proceedings of the 9th Workshop on Hot Topics in Operating Systems (HotOS IX).
+- Candea, G., Kawamoto, S., Fujiki, Y., Friedman, G., & Fox, A. (2004). *Microreboot &mdash; A Technique for Cheap Recovery.* 6th USENIX Symposium on Operating Systems Design and Implementation (OSDI).
+- Michael, M. M., & Scott, M. L. (1996). *Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms.* PODC '96.
+- AWS Elastic Beanstalk Documentation: *Restarting App Servers in Elastic Beanstalk Environments*.
+
+---
+
+*Academic project developed for BTech CSE 3rd Year Operating Systems Case Study.*
