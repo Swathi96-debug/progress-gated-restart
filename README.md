@@ -1,7 +1,9 @@
 # Progress-Gated Application-Server Restart Under Transient Load
-> **Operating Systems Case Study (BTech 3rd Year)**  
+> Operating Systems case study comparing progress-gated and fixed-threshold application restart policies under transient load.
+>
+> **Course:** Operating Systems Case Study (BTech 3rd Year)  
 > **Deployment Target:** AWS Elastic Beanstalk (Single-Instance Python Platform)  
-> **Phase 1 & 2:** Application Foundation & Experiment Framework
+> **Architecture:** Flask Foundation & Experiment Framework
 
 ---
 
