@@ -1,0 +1,41 @@
+# ==============================================================================
+# AWS Elastic Beanstalk Deployment Bundle Exclusion Rules (.ebignore)
+# Guarantees that secrets, virtualenvs, local results, and caches are excluded
+# while preserving application.py, Procfile, requirements.txt, and experiment/
+# ==============================================================================
+
+# Virtual Environments (never upload local workstation binaries)
+.venv/
+venv/
+env/
+ENV/
+
+# Secrets and environment files
+.env
+.env.*
+*.pem
+*.key
+*.cert
+
+# Python and testing caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local experiment logs, trial datasets, and results (preserve locally, do not upload)
+results/
+*.log
+*.csv
+!experiment/data/*.csv
+
+# Version control & IDE artifacts
+.git/
+.gitignore
+.vscode/
+.idea/
+.antigravity/
+.DS_Store
+Thumbs.db

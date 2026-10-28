@@ -1,0 +1,55 @@
+# ==============================================================================
+# Progress-Gated Application-Server Restart — Git Ignore Configuration
+# ==============================================================================
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest & testing artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment files, secrets, & credentials
+.env
+.env.*
+*.pem
+*.key
+*.cert
+*.id_rsa
+*.pub
+
+# Operating System & IDE artifacts
+.DS_Store
+Thumbs.db
+ehthumbs.db
+.vscode/
+.idea/
+.antigravity/
+.gemini/
+*.swp
+*.swo
+
+# Experiment outputs, trial logs, and temporary artifacts
+results/
+*.log
+scratch/
+
+# Deployment bundles & archives
+deployment/
+*.zip
+*.tar.gz
+
+# CSV files: exclude runtime exports, but preserve canonical bundled historical data
+*.csv
+!experiment/data/*.csv

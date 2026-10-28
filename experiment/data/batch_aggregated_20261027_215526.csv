@@ -1,0 +1,7 @@
+scenario,policy,trials_count,recovered_trials_count,successful_requests_mean,successful_requests_std,failed_requests_mean,failed_requests_std,success_rate_mean_percent,success_rate_std_percent,simulated_restarts_mean,simulated_restarts_std,real_aws_restarts_mean,real_aws_restarts_std,recovery_time_mean_seconds,recovery_time_std_seconds,estimated_downtime_mean_seconds,estimated_downtime_std_seconds
+transient_latency,control,5,5,35.00,0.00,0.00,0.00,100.00,0.00,0.00,0.00,0.00,0.00,1.58,0.16,0.00,0.00
+transient_latency,fixed_threshold,5,5,35.00,0.00,0.00,0.00,100.00,0.00,1.00,0.00,0.00,0.00,1.70,0.00,0.00,0.00
+transient_latency,progress_gated,5,5,35.00,0.00,0.00,0.00,100.00,0.00,0.00,0.00,0.00,0.00,1.70,0.00,0.00,0.00
+stalled_progress,control,5,0,10.00,0.00,25.00,0.00,28.57,0.00,0.00,0.00,0.00,0.00,N/A,N/A,2.39,0.01
+stalled_progress,fixed_threshold,5,5,35.00,0.00,0.00,0.00,100.00,0.00,1.00,0.00,0.00,0.00,0.79,0.01,0.00,0.00
+stalled_progress,progress_gated,5,5,35.00,0.00,0.00,0.00,100.00,0.00,1.00,0.00,0.00,0.00,1.10,0.00,0.00,0.00

@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Progress-Gated Application-Server Restart | OS Research Case Study</title>
+  <meta name="description" content="Research presentation dashboard and live evaluation system for Progress-Gated Application-Server Restart Under Transient Load.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="alternate icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/static/css/dashboard.css">
+</head>
+<body>
+  <!-- Top Navigation Bar -->
+  <header class="top-nav">
+    <div class="nav-brand">
+      <div class="brand-icon">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+        </svg>
+      </div>
+      <div>
+        <div class="brand-title">Progress-Gated Restart</div>
+        <div class="brand-subtitle">Operating Systems Case Study &bull; BTech 3rd Year</div>
+      </div>
+    </div>
+    <div class="nav-telemetry">
+      <div class="telemetry-pill status-pill" id="nav-server-status">
+        <span class="pulse-dot"></span>
+        <span id="nav-status-text">CONNECTING...</span>
+      </div>
+      <div class="telemetry-pill">
+        <span class="pill-label">PID:</span>
+        <span class="pill-val" id="nav-pid">--</span>
+      </div>
+      <div class="telemetry-pill">
+        <span class="pill-label">UPTIME:</span>
+        <span class="pill-val" id="nav-uptime">0s</span>
+      </div>
+      <div class="telemetry-pill">
+        <span class="pill-label">RTP LATENCY:</span>
+        <span class="pill-val text-cyan" id="nav-latency">-- ms</span>
+      </div>
+      <div class="telemetry-pill mode-badge">
+        <span class="pill-badge">LOCAL NODE &bull; EB ARCHITECTURE</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="dashboard-container">
+    <!-- Section 1: Overview & Theoretical Formulation -->
+    <section class="card hero-card" id="overview">
+      <div class="hero-header">
+        <div class="badge-tag">RESEARCH PROBLEM &amp; HYPOTHESIS</div>
+        <h1>Mitigating False-Positive Restarts Under Transient Load</h1>
+        <p class="hero-desc">
+          When cloud services suffer high latency, traditional <strong>Fixed-Threshold Restarts</strong> prematurely reboot healthy servers, destroying warm caches and cascading downtime. The <strong>Progress-Gated Policy</strong> monitors forward completion progress (&Delta;C) over bounded observation windows: withholding restarts while work continues to complete, and restarting only upon confirmed stall or hard deadline expiration.
+        </p>
+      </div>
+
+      <div class="policy-comparison-grid">
+        <div class="policy-spec-card policy-control">
+          <div class="policy-header">
+            <span class="policy-icon">&bull;</span>
+            <h3>No-Restart (Baseline)</h3>
+          </div>
+          <p class="policy-text">Observes natural recovery behavior without automated restarts. Measures baseline recovery latency under transient spikes and illustrates system starvation under permanent stalls.</p>
+          <div class="policy-tags">
+            <span class="tag">Zero Restarts</span>
+            <span class="tag">Natural Recovery</span>
+          </div>
+        </div>
+
+        <div class="policy-spec-card policy-fixed">
+          <div class="policy-header">
+            <span class="policy-icon">&bull;</span>
+            <h3>Fixed-Threshold Restart</h3>
+          </div>
+          <p class="policy-text">Reboots immediately when probe latency exceeds threshold <code>T</code> (e.g. 150ms/500ms). Triggers false-positive restarts on transient spikes where the app would have naturally recovered.</p>
+          <div class="policy-tags">
+            <span class="tag tag-warn">Immediate Trigger</span>
+            <span class="tag tag-warn">Cache Disruption</span>
+          </div>
+        </div>
+
+        <div class="policy-spec-card policy-gated">
+          <div class="policy-header">
+            <span class="policy-icon">&bull;</span>
+            <h3>Progress-Gated Restart</h3>
+          </div>
+          <p class="policy-text">Gated restart: observes &Delta;C = C<sub>t</sub> - C<sub>t-1</sub>. If &Delta;C &gt; 0, restart is withheld while forward progress continues. Reboots only if &Delta;C == 0 across observation window or hard deadline expires.</p>
+          <div class="policy-tags">
+            <span class="tag tag-success">&Delta;C Evaluated</span>
+            <span class="tag tag-success">Hard Deadline Bound</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 2: Live Telemetry & Monitoring -->
+    <section class="card" id="monitoring">
+      <div class="section-title-bar">
+        <div>
+          <div class="badge-tag">SYSTEM METRICS</div>
+          <h2>Live Node Diagnostics &amp; Telemetry</h2>
+        </div>
+        <div class="monitor-controls">
+          <div class="control-group">
+            <label for="poll-interval">Polling Rate:</label>
+            <select id="poll-interval" class="select-input">
+              <option value="1000">1.0s (Fast)</option>
+              <option value="2000" selected>2.0s (Standard)</option>
+              <option value="5000">5.0s (Relaxed)</option>
+              <option value="0">Paused</option>
+            </select>
+          </div>
+          <button id="btn-refresh-now" class="btn btn-secondary">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            Refresh Now
+          </button>
+        </div>
+      </div>
+
+      <!-- Live KPI Grid -->
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-label">Health Status</div>
+          <div class="kpi-value text-emerald" id="kpi-health">--</div>
+          <div class="kpi-sub" id="kpi-health-sub">GET /health</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">Fault State</div>
+          <div class="kpi-value text-cyan" id="kpi-fault-state">--</div>
+          <div class="kpi-sub">State: In-Memory</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">Completion Counter (C)</div>
+          <div class="kpi-value text-violet" id="kpi-completion-counter">--</div>
+          <div class="kpi-sub">Monotonic successful work</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">Work Requests Completed</div>
+          <div class="kpi-value" id="kpi-completed-requests">--</div>
+          <div class="kpi-sub">HTTP 200 responses</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">In-Flight / Failed</div>
+          <div class="kpi-value text-amber">
+            <span id="kpi-in-flight">0</span> / <span id="kpi-failed" class="text-rose">0</span>
+          </div>
+          <div class="kpi-sub">Active threads / Failures</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">Last Work Latency</div>
+          <div class="kpi-value text-cyan" id="kpi-latency">-- ms</div>
+          <div class="kpi-sub">Client reported roundtrip</div>
+        </div>
+      </div>
+
+      <!-- Live Workload Probe Tester -->
+      <div class="probe-tester-box">
+        <div class="probe-header">
+          <div>
+            <h4 class="probe-title">Interactive Workload Injection Probe</h4>
+            <p class="probe-desc">Dispatches an authentic request to <code>GET /work?delay_ms=N</code> to watch real-time latency and atomic completion counter increment.</p>
+          </div>
+          <div class="probe-controls">
+            <label for="probe-delay">Simulated Work Delay:</label>
+            <div class="input-with-unit">
+              <input type="number" id="probe-delay" value="40" min="0" max="5000" step="10" class="num-input">
+              <span class="unit">ms</span>
+            </div>
+            <button id="btn-send-probe" class="btn btn-primary">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              Send Work Probe
+            </button>
+          </div>
+        </div>
+        <div id="probe-result-feedback" class="probe-feedback hidden"></div>
+      </div>
+
+      <!-- Real-Time Chart Area -->
+      <div class="chart-container-box">
+        <div class="chart-header">
+          <div class="chart-title-group">
+            <span class="chart-legend-dot dot-cyan"></span>
+            <span class="chart-title">Observed Latency (ms)</span>
+            <span class="chart-legend-dot dot-violet" style="margin-left: 1rem;"></span>
+            <span class="chart-title">&Delta;C Progress Delta</span>
+          </div>
+          <div class="live-stream-badge">
+            <span class="pulse-dot"></span>
+            LIVE STREAMING &bull; ZERO SYNTHETIC DATA
+          </div>
+        </div>
+        <div class="chart-wrapper">
+          <canvas id="liveTelemetryChart" width="900" height="220"></canvas>
+        </div>
+        <div class="chart-footer">
+          <span>Horizontal dashed line indicates trigger threshold (T = 150ms). Points reflect real responses from <code>/metrics</code>.</span>
+          <span id="chart-point-count">0 points recorded</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 3: Experiment Configuration & Execution -->
+    <section class="card" id="experiment-studio">
+      <div class="section-title-bar">
+        <div>
+          <div class="badge-tag">EXPERIMENT LAB</div>
+          <h2>Interactive Benchmark Trial Execution</h2>
+        </div>
+        <div class="safety-indicator-badge">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          SAFE LOCAL SIMULATION &bull; ZERO AWS CHARGES
+        </div>
+      </div>
+
+      <div class="experiment-grid">
+        <!-- Configuration Controls -->
+        <div class="exp-config-panel">
+          <h3 class="panel-subtitle">Trial Parameters</h3>
+          
+          <div class="form-row">
+            <label class="form-label">Recovery Policy Under Test:</label>
+            <div class="radio-card-group" role="radiogroup" aria-label="Recovery Policy Under Test">
+              <label class="radio-card" for="policy-control">
+                <input type="radio" id="policy-control" name="exp-policy" value="control" aria-label="Control (No restart baseline)" checked>
+                <div class="radio-content">
+                  <div class="radio-title">Control</div>
+                  <div class="radio-desc">No restart baseline</div>
+                </div>
+              </label>
+              <label class="radio-card" for="policy-fixed-threshold">
+                <input type="radio" id="policy-fixed-threshold" name="exp-policy" value="fixed_threshold" aria-label="Fixed-Threshold (Restart immediately if latency exceeds threshold)">
+                <div class="radio-content">
+                  <div class="radio-title">Fixed-Threshold</div>
+                  <div class="radio-desc">Restart immediately if latency &gt; T</div>
+                </div>
+              </label>
+              <label class="radio-card" for="policy-progress-gated">
+                <input type="radio" id="policy-progress-gated" name="exp-policy" value="progress_gated" aria-label="Progress-Gated (Withhold while progress continues, restart on stall)">
+                <div class="radio-content">
+                  <div class="radio-title">Progress-Gated</div>
+                  <div class="radio-desc">Withhold while &Delta;C &gt; 0, restart on stall</div>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <label class="form-label">Failure Scenario:</label>
+            <div class="scenario-pill-group" role="radiogroup" aria-label="Failure Scenario">
+              <label class="scenario-pill" for="scenario-transient-latency">
+                <input type="radio" id="scenario-transient-latency" name="exp-scenario" value="transient_latency" aria-label="Transient Latency Spike (250ms exceeds 150ms for 1.0s; Delta C > 0)" checked>
+                <span>Transient Latency Spike (250ms &gt; 150ms for 1.0s; &Delta;C &gt; 0)</span>
+              </label>
+              <label class="scenario-pill" for="scenario-stalled-progress">
+                <input type="radio" id="scenario-stalled-progress" name="exp-scenario" value="stalled_progress" aria-label="Stalled Progress (Worker threads block; Delta C == 0)">
+                <span>Stalled Progress (Worker threads block; &Delta;C == 0)</span>
+              </label>
+              <label class="scenario-pill" for="scenario-flapping-overload">
+                <input type="radio" id="scenario-flapping-overload" name="exp-scenario" value="flapping_overload" aria-label="Flapping Overload (HTTP 503 rejection bursts; intermittent load-shedding)">
+                <span>Flapping Overload (HTTP 503 rejection bursts; intermittent load-shedding)</span>
+              </label>
+              <label class="scenario-pill" for="scenario-transient-overload">
+                <input type="radio" id="scenario-transient-overload" name="exp-scenario" value="transient_overload" aria-label="Transient Overload (HTTP 503 sustained load-shedding window)">
+                <span>Transient Overload (HTTP 503 sustained load-shedding window)</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="param-inputs-grid">
+            <div class="form-field">
+              <label for="param-duration">Trial Duration (s):</label>
+              <input type="number" id="param-duration" value="3.5" min="2.0" max="10.0" step="0.5" class="num-input">
+              <span class="field-hint" style="font-size: 0.72rem; color: #94a3b8; display: block; margin-top: 3px;">&ge; 3.5s recommended to allow post-fault recovery observation.</span>
+            </div>
+            <div class="form-field">
+              <label for="param-threshold">Latency Threshold T (ms):</label>
+              <input type="number" id="param-threshold" value="150" min="50" max="1000" step="25" class="num-input">
+            </div>
+            <div class="form-field">
+              <label for="param-obs-interval">Observation Interval (s):</label>
+              <input type="number" id="param-obs-interval" value="0.3" min="0.1" max="1.5" step="0.1" class="num-input">
+            </div>
+            <div class="form-field">
+              <label for="param-spike-delay">Degraded Work Delay (ms):</label>
+              <input type="number" id="param-spike-delay" value="250" min="100" max="2000" step="25" class="num-input">
+            </div>
+            <div class="form-field">
+              <label for="param-random-seed">Random Seed (Optional):</label>
+              <input type="number" id="param-random-seed" placeholder="e.g. 42 (leave blank for baseline)" min="0" max="2147483647" step="1" class="num-input">
+              <span class="field-hint" style="font-size: 0.72rem; color: #94a3b8; display: block; margin-top: 3px;">Matched seeds guarantee identical schedules across policies.</span>
+            </div>
+            <div class="form-field">
+              <label for="param-arrival-jitter">Arrival Jitter (0.0 &ndash; 0.5):</label>
+              <input type="number" id="param-arrival-jitter" value="0.0" min="0.0" max="0.5" step="0.05" class="num-input">
+              <span class="field-hint" style="font-size: 0.72rem; color: #94a3b8; display: block; margin-top: 3px;">Stochastic arrival interval variance (requires seed).</span>
+            </div>
+            <div class="form-field">
+              <label for="param-latency-jitter">Latency Jitter (0.0 &ndash; 0.5):</label>
+              <input type="number" id="param-latency-jitter" value="0.0" min="0.0" max="0.5" step="0.05" class="num-input">
+              <span class="field-hint" style="font-size: 0.72rem; color: #94a3b8; display: block; margin-top: 3px;">Stochastic request latency variance (requires seed).</span>
+            </div>
+          </div>
+
+          <div class="action-bar">
+            <button id="btn-launch-trial" class="btn btn-launch">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              Execute Matched Trial
+            </button>
+            <span class="action-note">Trial creates an immutable audit record in <code>results/</code></span>
+          </div>
+        </div>
+
+        <!-- Execution Monitor & Terminal -->
+        <div class="exp-execution-panel">
+          <h3 class="panel-subtitle">Execution Pipeline &amp; Telemetry Log</h3>
+          
+          <div class="execution-progress-bar-container">
+            <div class="progress-bar-track">
+              <div id="trial-progress-bar" class="progress-bar-fill" style="width: 0%;"></div>
+            </div>
+            <div class="progress-status-row">
+              <span id="trial-stage-label" class="status-label">IDLE &bull; Ready for execution</span>
+              <span id="trial-timer" class="status-timer">0.0s / 3.5s</span>
+            </div>
+          </div>
+
+          <!-- Real-Time Decision Terminal -->
+          <div class="terminal-box" id="trial-terminal">
+            <div class="term-line term-system">[SYSTEM] Experiment Runner v1.0 initialized.</div>
+            <div class="term-line term-system">[SYSTEM] Adapter: SimulatedRestartAdapter (Deterministic isolated state).</div>
+            <div class="term-line term-system">[SYSTEM] Awaiting trial launch...</div>
+          </div>
+
+          <!-- Completed Trial Result Banner -->
+          <div id="trial-result-banner" class="trial-result-card hidden">
+            <div class="result-card-header">
+              <span class="result-badge" id="result-badge-status">RECOVERED</span>
+              <span class="result-trial-id" id="result-trial-id">trial_id</span>
+            </div>
+            <div class="result-metrics-grid">
+              <div>
+                <span class="metric-title">Success Rate:</span>
+                <span class="metric-val text-emerald" id="res-success-rate">100.0%</span>
+              </div>
+              <div>
+                <span class="metric-title">Restarts Triggered:</span>
+                <span class="metric-val text-cyan" id="res-restarts">0</span>
+              </div>
+              <div>
+                <span class="metric-title">Recovery Time:</span>
+                <span class="metric-val" id="res-recovery-time">1.41s</span>
+              </div>
+              <div>
+                <span class="metric-title">Estimated Downtime:</span>
+                <span class="metric-val" id="res-downtime">0.00s</span>
+              </div>
+              <div>
+                <span class="metric-title">Restart Overhead:</span>
+                <span class="metric-val text-cyan" id="res-restart-overhead">0.00s</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 4: Verified 30-Trial Benchmark Results -->
+    <section class="card" id="results-section">
+      <div class="section-title-bar">
+        <div>
+          <div class="badge-tag">HISTORICAL BENCHMARK &bull; LOCAL SIMULATION (REAL AWS RESTARTS: 0)</div>
+          <h2>30-Trial Local Simulated Benchmark (5 Trials &times; 3 Policies &times; 2 Scenarios)</h2>
+          <p style="font-size: 0.8rem; color: #94a3b8; margin-top: 0.35rem;">Provenanced from reproducible local batch execution using <code>SimulatedRestartAdapter</code> (real AWS restarts = 0 across all trials). Baseline OS research dataset.</p>
+        </div>
+        <div class="export-actions">
+          <button id="btn-export-agg" class="btn btn-secondary">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+            Export Aggregated CSV
+          </button>
+          <button id="btn-export-summary" class="btn btn-secondary">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+            Export 42-Row Summary CSV
+          </button>
+        </div>
+      </div>
+
+      <!-- Comparative Bar Visualizations -->
+      <div class="comparison-viz-grid">
+        <div class="viz-card">
+          <h4 class="viz-title">Transient Latency: Unnecessary Restarts (Mean &plusmn; Std)</h4>
+          <p class="viz-sub">Progress-Gated eliminates false-positive restarts under transient spikes.</p>
+          <div class="bar-chart-container">
+            <div class="bar-row">
+              <span class="bar-label">Control:</span>
+              <div class="bar-track"><div class="bar-fill bar-zero" style="width: 2%;">0.0</div></div>
+            </div>
+            <div class="bar-row">
+              <span class="bar-label">Progress-Gated:</span>
+              <div class="bar-track"><div class="bar-fill bar-emerald" style="width: 2%;">0.0 &plusmn; 0.0</div></div>
+            </div>
+            <div class="bar-row">
+              <span class="bar-label">Fixed-Threshold:</span>
+              <div class="bar-track"><div class="bar-fill bar-rose" style="width: 100%;">1.0 &plusmn; 0.0 (Unnecessary)</div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="viz-card">
+          <h4 class="viz-title">Stalled Progress: Recovery Capability &amp; Success Rate</h4>
+          <p class="viz-sub">Progress-Gated successfully detects stall and recovers via restart.</p>
+          <div class="bar-chart-container">
+            <div class="bar-row">
+              <span class="bar-label">Control:</span>
+              <div class="bar-track"><div class="bar-fill bar-rose" style="width: 28.6%;">28.6% (Unrecovered)</div></div>
+            </div>
+            <div class="bar-row">
+              <span class="bar-label">Progress-Gated:</span>
+              <div class="bar-track"><div class="bar-fill bar-emerald" style="width: 100%;">100.0% (1.10s Rec.)</div></div>
+            </div>
+            <div class="bar-row">
+              <span class="bar-label">Fixed-Threshold:</span>
+              <div class="bar-track"><div class="bar-fill bar-cyan" style="width: 100%;">100.0% (0.80s Rec.)</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Aggregated Statistical Table -->
+      <div class="table-responsive">
+        <table class="data-table" id="table-aggregates">
+          <thead>
+            <tr>
+              <th>Scenario</th>
+              <th>Policy</th>
+              <th>Trials</th>
+              <th>Recovered</th>
+              <th>Success Rate (Mean &plusmn; Std)</th>
+              <th>Simulated Restarts</th>
+              <th>Real AWS Restarts (0)</th>
+              <th>Recovery Time (Mean &plusmn; Std)</th>
+              <th>Downtime (Mean &plusmn; Std)</th>
+            </tr>
+          </thead>
+          <tbody id="table-aggregates-body">
+            <tr><td colspan="9" class="text-center">Loading aggregated benchmark dataset...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Recent Trial Log History -->
+      <div class="trial-history-box">
+        <div class="history-header">
+          <h4 class="history-title">Recent Immutable Trial Records</h4>
+          <span class="history-count" id="trial-history-count">0 trials loaded</span>
+        </div>
+        <div class="table-responsive">
+          <table class="data-table data-table-sm" id="table-trials">
+            <thead>
+              <tr>
+                <th>Trial Index</th>
+                <th>Scenario</th>
+                <th>Policy</th>
+                <th>Trial ID</th>
+                <th>Requests</th>
+                <th>Success %</th>
+                <th>Restarts</th>
+                <th>Recovery Time</th>
+                <th>Downtime</th>
+                <th>Mean Latency</th>
+              </tr>
+            </thead>
+            <tbody id="table-trials-body">
+              <tr><td colspan="10" class="text-center">Loading trial history...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 5: Architecture, Deployment, & Safety Specifications -->
+    <section class="card" id="architecture-safety">
+      <div class="section-title-bar">
+        <div>
+          <div class="badge-tag">SYSTEMS ARCHITECTURE</div>
+          <h2>Elastic Beanstalk Infrastructure &amp; Operational Safety</h2>
+        </div>
+      </div>
+
+      <div class="safety-grid">
+        <div class="safety-card">
+          <h4>WSGI Concurrency Model</h4>
+          <p>Elastic Beanstalk runs Gunicorn behind Nginx with <code>--workers=1 --threads=8 --bind 0.0.0.0:8000</code>. Single worker process ensures in-memory atomic state (completion counter, fault events) remains coherent without inter-process fragmentation.</p>
+        </div>
+
+        <div class="safety-card">
+          <h4>Mechanical Safety Interlocks</h4>
+          <p>Live AWS server restarts require explicit double authorization: <code>--allow-restarts</code> CLI flag and valid IAM permissions for <code>elasticbeanstalk:RestartAppServer</code>. In web dashboard mode, real restarts are disabled by design.</p>
+        </div>
+
+        <div class="safety-card">
+          <h4>Honest Recovery Criteria</h4>
+          <p>AWS API return code 200 represents API acceptance only. True application recovery is recorded solely when the deployed server responds with <code>N=3</code> consecutive healthy, low-latency probes (&le; 300ms) post-restart.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Safety Confirmation Modal -->
+  <div id="safety-modal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-icon-warning">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        </div>
+        <div>
+          <h3 class="modal-title">Confirm Experiment Execution</h3>
+          <p class="modal-subtitle">Operating Systems Research Benchmark</p>
+        </div>
+      </div>
+
+      <div class="modal-body">
+        <p>You are about to launch a controlled benchmark trial with the following configuration:</p>
+        <ul class="modal-spec-list">
+          <li><strong>Policy:</strong> <span id="modal-policy-val">--</span></li>
+          <li><strong>Scenario:</strong> <span id="modal-scenario-val">--</span></li>
+          <li><strong>Duration:</strong> <span id="modal-duration-val">--</span></li>
+          <li><strong>Random Seed:</strong> <span id="modal-seed-val">None (Deterministic)</span></li>
+          <li><strong>Execution Mode:</strong> <span class="text-emerald">LOCAL SIMULATED ADAPTER</span></li>
+        </ul>
+        <div class="modal-alert">
+          <strong>Safety Guarantee:</strong> This trial executes locally via <code>SimulatedRestartAdapter</code>. Zero AWS APIs are invoked, no cloud infrastructure is mutated, and zero charges are incurred.
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button id="btn-modal-cancel" class="btn btn-secondary">Cancel</button>
+        <button id="btn-modal-confirm" class="btn btn-primary">Authorize &amp; Launch Trial</button>
+      </div>
+    </div>
+  </div>
+
+  <footer class="dashboard-footer">
+    <div class="footer-content">
+      <span>Progress-Gated Application-Server Restart &bull; Operating Systems Case Study</span>
+      <span>AWS Elastic Beanstalk (Amazon Linux 2023) &bull; Single-Instance Architecture</span>
+    </div>
+  </footer>
+
+  <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
